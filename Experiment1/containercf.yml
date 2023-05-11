@@ -1,0 +1,324 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Serverless patterns - API Gateway to Private HTTP Endpoint via VPC Link
+
+# Parameters to input VPC id and private subnet ids where the ECS cluster and Application Load Balancer will be created.
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: The ID of the VPC where the ECS cluster will be deployed
+    Default: vpc-01xx
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: The IDs of the subnets where the ECS tasks will be deployed
+    Default: subnet-a, subnet-b, subnet-c
+  ApplicationName:
+    Description: app name
+    Type: String
+    Default: containerweb
+  Environment:
+    Description: deployment env
+    Type: String
+    Default: staging
+
+Resources:
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: container-users 
+      AttributeDefinitions: 
+        - AttributeName: id
+          AttributeType: S
+      BillingMode: PAY_PER_REQUEST
+      KeySchema: 
+        - AttributeName: id
+          KeyType: HASH
+      Tags: 
+        - Key: "Application"
+          Value: !Ref ApplicationName
+        - Key: "Environment"
+          Value: !Ref Environment
+
+  # Load balancer security group. CIDR and port ingress can be changed as required.
+  LoadBalancerSG:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: LoadBalancer Security Group
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          Description: Allow from anyone on port 8080
+          FromPort: 8080
+          IpProtocol: tcp
+          ToPort: 8080
+      VpcId: !Ref VpcId
+      Tags: 
+        - Key: "Application"
+          Value: !Ref ApplicationName
+        - Key: "Environment"
+          Value: !Ref Environment
+  # Load balancer security group egress rule to ECS cluster security group.
+  LoadBalancerSGEgressToECSSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroupEgress'
+    Properties:
+      GroupId: !GetAtt 
+        - LoadBalancerSG
+        - GroupId
+      IpProtocol: tcp
+      Description: Target group egress
+      DestinationSecurityGroupId: !GetAtt 
+        - ECSSecurityGroup
+        - GroupId
+      FromPort: 8080
+      ToPort: 8080
+  # ECS cluster security group.
+  ECSSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: ECS Security Group
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic by default
+          IpProtocol: '-1'
+      VpcId: !Ref VpcId
+      Tags: 
+        - Key: "Application"
+          Value: !Ref ApplicationName
+        - Key: "Environment"
+          Value: !Ref Environment
+  # ECS cluster security group ingress from the load balancer.
+  ECSSecurityGroupIngressFromLoadBalancer:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      IpProtocol: tcp
+      Description: Ingress from Load Balancer
+      FromPort: 8080
+      GroupId: !GetAtt 
+        - ECSSecurityGroup
+        - GroupId
+      SourceSecurityGroupId: !GetAtt 
+        - LoadBalancerSG
+        - GroupId
+      ToPort: 8080
+  # Create the internal application load balancer (ALB) in the private subnets.
+  LoadBalancer:
+    Type: 'AWS::ElasticLoadBalancingV2::LoadBalancer'
+    Properties:
+      # Scheme: internal
+      Scheme: internet-facing
+      SecurityGroups:
+        - !GetAtt 
+          - LoadBalancerSG
+          - GroupId
+      Subnets: !Ref PrivateSubnetIds
+      Type: application
+      Tags: 
+        - Key: "Application"
+          Value: !Ref ApplicationName
+        - Key: "Environment"
+          Value: !Ref Environment
+  # Create the ALB target group for ECS.
+  LoadBalancerListenerTargetGroupECS:
+    Type: 'AWS::ElasticLoadBalancingV2::TargetGroup'
+    Properties:
+      Port: 8080
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref VpcId
+      Tags: 
+        - Key: "Application"
+          Value: !Ref ApplicationName
+        - Key: "Environment"
+          Value: !Ref Environment
+  # Create the ALB listener with the target group.
+  LoadBalancerListener:
+    Type: 'AWS::ElasticLoadBalancingV2::Listener'
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref LoadBalancerListenerTargetGroupECS
+          Type: forward
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 8080
+      Protocol: HTTP
+  # Create the ECS Cluster and Fargate launch type service in the private subnets
+  ECSFargateCluster:
+    Type: 'AWS::ECS::Cluster'
+  ECSService:
+    Type: 'AWS::ECS::Service'
+    Properties:
+      Cluster: !Ref ECSFargateCluster
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 50
+      DesiredCount: 2
+      EnableECSManagedTags: false
+      # HealthCheckGracePeriodSeconds: 180
+      LaunchType: FARGATE
+      LoadBalancers:
+        - ContainerName: containerwebapi
+          ContainerPort: 8080
+          TargetGroupArn: !Ref LoadBalancerListenerTargetGroupECS
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !GetAtt 
+              - ECSSecurityGroup
+              - GroupId
+          Subnets: !Ref PrivateSubnetIds
+      TaskDefinition: !Ref ECSServiceTaskDefinition
+      Tags: 
+        - Key: "Application"
+          Value: !Ref ApplicationName
+        - Key: "Environment"
+          Value: !Ref Environment
+    DependsOn:
+      - LoadBalancerListenerTargetGroupECS
+      - LoadBalancerListener
+
+  # Create the ECS Service task definition. 
+  # 'nginx' image is being used in the container definition.
+  # This image is pulled from the docker hub which is the default image repository.
+  # ECS task execution role and the task role is used which can be attached with additional IAM policies to configure the required permissions.
+  ECSServiceTaskDefinition:
+    Type: 'AWS::ECS::TaskDefinition'
+    Properties:
+      ContainerDefinitions:
+        - Essential: true
+          Image: imageuri
+          # Image: public.ecr.aws/e0f0i7n7/hello-world
+          Name: containerwebapi
+          PortMappings:
+            - ContainerPort: 8080
+              HostPort: 8080
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: firelens-container
+              awslogs-region: eu-central-1
+              awslogs-create-group: true
+              awslogs-stream-prefix: ccf-admin
+              mode: non-blocking
+      Cpu: '512'
+      ExecutionRoleArn: !GetAtt 
+        - ECSTaskExecutionRole
+        - Arn
+      Memory: '1024'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      TaskRoleArn: !GetAtt 
+        - ECSTaskRole
+        - Arn
+      Tags: 
+        - Key: "Application"
+          Value: !Ref ApplicationName
+        - Key: "Environment"
+          Value: !Ref Environment
+  ECSTaskExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Action: 'sts:AssumeRole'
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+        Version: 2012-10-17
+      Policies: 
+        - PolicyName: AccessECR
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - "ecr:GetAuthorizationToken"
+                  - "ecr:BatchCheckLayerAvailability"
+                  - "ecr:GetDownloadUrlForLayer"
+                  - "ecr:BatchGetImage"
+                  - "logs:*"
+                Resource: '*'
+  ECSTaskRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+        Version: 2012-10-17
+      Policies: 
+        - PolicyName: AccessDynamo
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - dynamodb:BatchGetItem
+                  - dynamodb:Scan
+                  - dynamodb:DeleteItem
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:UpdateItem
+                Resource: '*'
+  # Create the VPC Link configured with the private subnets. Security groups are kept empty here, but can be configured as required.
+  VpcLink:
+      Type: 'AWS::ApiGatewayV2::VpcLink'
+      Properties:
+          Name: APIGWVpcLinkToPrivateHTTPEndpoint
+          SubnetIds: !Ref PrivateSubnetIds
+          SecurityGroupIds: []
+  # Create the API Gateway HTTP endpoint
+  APIGWHTTPEndpoint:
+      Type: 'AWS::ApiGatewayV2::Api'
+      Properties:
+          Name: serverlessland-pvt-endpoint
+          ProtocolType: HTTP
+          Tags: 
+            Application: !Ref ApplicationName
+            Environment: !Ref Environment
+  # Create the API Gateway HTTP_PROXY integration between the created API and the private load balancer via the VPC Link.
+  # Ensure that the 'DependsOn' attribute has the VPC Link dependency.
+  # This is to ensure that the VPC Link is created successfully before the integration and the API GW routes are created.
+  APIGWHTTPEndpointIntegration:
+      Type: 'AWS::ApiGatewayV2::Integration'
+      Properties:
+        ApiId: !Ref APIGWHTTPEndpoint
+        IntegrationType: HTTP_PROXY
+        ConnectionId: !Ref VpcLink
+        ConnectionType: VPC_LINK
+        IntegrationMethod: ANY
+        IntegrationUri: !Ref LoadBalancerListener
+        PayloadFormatVersion: '1.0'
+      DependsOn:
+      - VpcLink
+      - APIGWHTTPEndpoint
+      - LoadBalancerListener
+  # API GW route with ANY method
+  APIGWRoute:
+    Type: 'AWS::ApiGatewayV2::Route'
+    Properties:
+      ApiId: !Ref APIGWHTTPEndpoint
+      RouteKey: 'ANY /{proxy+}'
+      Target: !Join 
+        - /
+        - - integrations
+          - !Ref APIGWHTTPEndpointIntegration
+    DependsOn:
+    - APIGWHTTPEndpointIntegration
+  # Set a default stage
+  APIStageDefault:
+    Type: 'AWS::ApiGatewayV2::Stage'
+    Properties:
+      ApiId: !Ref APIGWHTTPEndpoint
+      StageName: $default
+      AutoDeploy: true
+    DependsOn:
+      - APIGWHTTPEndpoint
+
+Outputs:
+  # Generated API GW endpoint URL that can be used to access the application running on a private ECS Fargate cluster.
+  APIGWEndpoint:
+    Description: API Gateway Endpoint
+    Value: !GetAtt APIGWHTTPEndpoint.ApiEndpoint
